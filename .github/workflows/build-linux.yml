@@ -2,11 +2,15 @@ name: Linux Build & Release
 
 on:
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
       debug:
         description: "Build Debug instead of Release"
+        type: boolean
+        default: false
+      force_build:
+        description: "Force build even if no new commits/tags"
         type: boolean
         default: false
 
@@ -20,9 +24,56 @@ jobs:
       - name: Checkout Ayugram-Builds
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1
+
+      - name: Get latest AyuGram info via API
+        id: ayugram_info
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          STABLE_TAG=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+            https://api.github.com/repos/AyuGram/AyuGramDesktop/releases/latest | jq -r '.tag_name')
+          
+          if [ "$STABLE_TAG" == "null" ] || [ -z "$STABLE_TAG" ]; then
+            STABLE_TAG=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+              https://api.github.com/repos/AyuGram/AyuGramDesktop/tags | jq -r '.[0].name')
+          fi
+          echo "stable_tag=$STABLE_TAG" >> $GITHUB_OUTPUT
+
+          DEV_COMMIT=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+            https://api.github.com/repos/AyuGram/AyuGramDesktop/commits/dev | jq -r '.sha[:7]')
+          echo "dev_commit=$DEV_COMMIT" >> $GITHUB_OUTPUT
+
+      - name: Read tracking files
+        id: track
+        run: |
+          STORED_STABLE=$(cat stable_version.txt 2>/dev/null || echo "")
+          STORED_NIGHTLY=$(cat nightly_commit.txt 2>/dev/null || echo "")
+          echo "stored_stable=$STORED_STABLE" >> $GITHUB_OUTPUT
+          echo "stored_nightly=$STORED_NIGHTLY" >> $GITHUB_OUTPUT
+
+      - name: Determine if build is needed
+        id: build_needed
+        run: |
+          STABLE="${{ steps.ayugram_info.outputs.stable_tag }}"
+          NIGHTLY="${{ steps.ayugram_info.outputs.dev_commit }}"
+          STORED_STABLE="${{ steps.track.outputs.stored_stable }}"
+          STORED_NIGHTLY="${{ steps.track.outputs.stored_nightly }}"
+          FORCE="${{ github.event.inputs.force_build }}"
+
+          if [ "$FORCE" == "true" ]; then
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "reason=Force build triggered" >> $GITHUB_OUTPUT
+          elif [ "$STABLE" != "$STORED_STABLE" ] || [ "$NIGHTLY" != "$STORED_NIGHTLY" ]; then
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "reason=New commit or tag detected" >> $GITHUB_OUTPUT
+          else
+            echo "should_build=false" >> $GITHUB_OUTPUT
+            echo "reason=No changes detected" >> $GITHUB_OUTPUT
+          fi
 
       - name: Checkout AyuGram source
+        if: steps.build_needed.outputs.should_build == 'true'
         uses: actions/checkout@v4
         with:
           repository: AyuGram/AyuGramDesktop
@@ -30,70 +81,25 @@ jobs:
           path: source
           fetch-depth: 0
 
-      - name: Get latest official tag
-        id: stable
-        run: |
-          cd source
-          LATEST_TAG=$(git tag -l 'v*' | sort -V | tail -n1)
-          echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
-
-      - name: Get commit hash for nightly
-        id: commit
-        run: |
-          cd source
-          COMMIT_HASH=$(git rev-parse --short HEAD)
-          echo "hash=$COMMIT_HASH" >> $GITHUB_OUTPUT
-
-      - name: Read tracking files
-        id: track
-        run: |
-          STABLE_FILE="stable_version.txt"
-          NIGHTLY_FILE="nightly_commit.txt"
-
-          if [ -f "$STABLE_FILE" ]; then
-            STORED_STABLE=$(cat "$STABLE_FILE")
-          else
-            STORED_STABLE=""
-          fi
-          if [ -f "$NIGHTLY_FILE" ]; then
-            STORED_NIGHTLY=$(cat "$NIGHTLY_FILE")
-          else
-            STORED_NIGHTLY=""
-          fi
-
-          echo "stored_stable=$STORED_STABLE" >> $GITHUB_OUTPUT
-          echo "stored_nightly=$STORED_NIGHTLY" >> $GITHUB_OUTPUT
-
-      - name: Determine if build is needed
-        id: build_needed
-        run: |
-          STABLE="${{ steps.stable.outputs.tag }}"
-          NIGHTLY="${{ steps.commit.outputs.hash }}"
-          STORED_STABLE="${{ steps.track.outputs.stored_stable }}"
-          STORED_NIGHTLY="${{ steps.track.outputs.stored_nightly }}"
-
-          if [ "$STABLE" != "$STORED_STABLE" ] || [ "$NIGHTLY" != "$STORED_NIGHTLY" ]; then
-            echo "should_build=true" >> $GITHUB_OUTPUT
-          else
-            echo "should_build=false" >> $GITHUB_OUTPUT
-          fi
-
       - name: Cache ccache
+        if: steps.build_needed.outputs.should_build == 'true'
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ccache-${{ runner.os }}-${{ github.ref }}
+          key: ccache-${{ runner.os }}-ayugram
           restore-keys: ccache-${{ runner.os }}-
 
       - name: Prepare ccache directory
+        if: steps.build_needed.outputs.should_build == 'true'
         run: mkdir -p ~/.ccache
 
       - name: Build stable from tag
-        id: build_stable
-        if: steps.build_needed.outputs.should_build == 'true' && steps.stable.outputs.tag != ''
+        if: steps.build_needed.outputs.should_build == 'true' && steps.ayugram_info.outputs.stable_tag != 'null' && steps.ayugram_info.outputs.stable_tag != ''
+        env:
+          BUILD_TYPE: ${{ github.event.inputs.debug == 'true' && 'Debug' || 'Release' }}
         run: |
           cd source
-          git checkout ${{ steps.stable.outputs.tag }}
+          git checkout ${{ steps.ayugram_info.outputs.stable_tag }}
           docker run --rm \
             -u $(id -u) \
             -v "$PWD:/usr/src/tdesktop" \
@@ -103,18 +109,22 @@ jobs:
             -D TDESKTOP_API_ID=${{ secrets.TDESKTOP_API_ID }} \
             -D TDESKTOP_API_HASH=${{ secrets.TDESKTOP_API_HASH }} \
             -D LTO=ON \
-            ${{ github.event.inputs.debug == 'true' && '-D CMAKE_BUILD_TYPE=Debug' || '' }}
-          strip --strip-all out/Release/AyuGram -o AyuGram-stripped
+            -D CMAKE_BUILD_TYPE=${BUILD_TYPE}
+
+          OUT_DIR="out/Release"
+          [ "${BUILD_TYPE}" == "Debug" ] && OUT_DIR="out/Debug"
+          
+          strip --strip-all "$OUT_DIR/AyuGram" -o AyuGram-stripped
           chmod +x AyuGram-stripped
           mkdir -p Ayugram
           cp AyuGram-stripped Ayugram/AyuGram
-          VERSION=${{ steps.stable.outputs.tag }}
+          VERSION="${{ steps.ayugram_info.outputs.stable_tag }}"
           tar -cJf "ayugram-${VERSION#v}-x86_64.tar.xz" Ayugram
-          mv "ayugram-${VERSION#v}-x86_64.tar.xz" ../  # move to workspace root
 
       - name: Build nightly from dev
-        id: build_nightly
         if: steps.build_needed.outputs.should_build == 'true'
+        env:
+          BUILD_TYPE: ${{ github.event.inputs.debug == 'true' && 'Debug' || 'Release' }}
         run: |
           cd source
           git checkout dev
@@ -127,35 +137,36 @@ jobs:
             -D TDESKTOP_API_ID=${{ secrets.TDESKTOP_API_ID }} \
             -D TDESKTOP_API_HASH=${{ secrets.TDESKTOP_API_HASH }} \
             -D LTO=ON \
-            ${{ github.event.inputs.debug == 'true' && '-D CMAKE_BUILD_TYPE=Debug' || '' }}
-          strip --strip-all out/Release/AyuGram -o AyuGram-stripped
+            -D CMAKE_BUILD_TYPE=${BUILD_TYPE}
+          
+          OUT_DIR="out/Release"
+          [ "${BUILD_TYPE}" == "Debug" ] && OUT_DIR="out/Debug"
+
+          strip --strip-all "$OUT_DIR/AyuGram" -o AyuGram-stripped
           chmod +x AyuGram-stripped
           mkdir -p Ayugram
           cp AyuGram-stripped Ayugram/AyuGram
-          COMMIT_HASH=${{ steps.commit.outputs.hash }}
+          COMMIT_HASH="${{ steps.ayugram_info.outputs.dev_commit }}"
           tar -cJf "ayugram-desktop-git-${COMMIT_HASH}-x86_64.tar.xz" Ayugram
-          mv "ayugram-desktop-git-${COMMIT_HASH}-x86_64.tar.xz" ../
 
       - name: Update tracking files
         if: steps.build_needed.outputs.should_build == 'true'
         run: |
-          echo "${{ steps.stable.outputs.tag }}" > stable_version.txt
-          echo "${{ steps.commit.outputs.hash }}" > nightly_commit.txt
+          echo "${{ steps.ayugram_info.outputs.stable_tag }}" > stable_version.txt
+          echo "${{ steps.ayugram_info.outputs.dev_commit }}" > nightly_commit.txt
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add stable_version.txt nightly_commit.txt
-          if git commit -m "Update tracking: stable ${{ steps.stable.outputs.tag }}, nightly ${{ steps.commit.outputs.hash }}"; then
+          if git commit -m "chore: update tracking to stable ${{ steps.ayugram_info.outputs.stable_tag }}, nightly ${{ steps.ayugram_info.outputs.dev_commit }}"; then
             git push
-          else
-            echo "No changes to commit."
           fi
 
       - name: Create stable release
-        if: steps.build_needed.outputs.should_build == 'true' && steps.stable.outputs.tag != ''
+        if: steps.build_needed.outputs.should_build == 'true' && steps.ayugram_info.outputs.stable_tag != 'null' && steps.ayugram_info.outputs.stable_tag != ''
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${{ steps.stable.outputs.tag }}"
+          TAG="${{ steps.ayugram_info.outputs.stable_tag }}"
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" &>/dev/null; then
             echo "Release $TAG already exists, skipping."
           else
@@ -171,14 +182,15 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          NIGHTLY_ARCHIVE="ayugram-desktop-git-${{ steps.commit.outputs.hash }}-x86_64.tar.xz"
+          COMMIT_HASH="${{ steps.ayugram_info.outputs.dev_commit }}"
+          NIGHTLY_ARCHIVE="ayugram-desktop-git-${COMMIT_HASH}-x86_64.tar.xz"
           if [ -f "$NIGHTLY_ARCHIVE" ]; then
             gh release delete nightly --repo "$GITHUB_REPOSITORY" -y 2>/dev/null || true
             gh release create nightly \
               --repo "$GITHUB_REPOSITORY" \
               --prerelease \
-              --title "Nightly build (commit ${{ steps.commit.outputs.hash }})" \
-              --notes "Built from latest AyuGram dev branch (commit ${{ steps.commit.outputs.hash }})." \
+              --title "Nightly build (commit ${COMMIT_HASH})" \
+              --notes "Built from latest AyuGram dev branch (commit ${COMMIT_HASH})." \
               "$NIGHTLY_ARCHIVE"
           else
             echo "Nightly archive not found, skipping."
